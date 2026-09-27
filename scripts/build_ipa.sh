@@ -7,6 +7,7 @@ mkdir -p build
 echo "Build Started!"
 echo
 
+set +e
 xcodebuild \
   -project lara.xcodeproj \
   -scheme lara \
@@ -19,6 +20,14 @@ xcodebuild \
   CODE_SIGN_ENTITLEMENTS="Config/lara.entitlements" \
   archive \
   -archivePath "$PWD/build/lara.xcarchive" 2>&1 | tee build/xcodebuild.log | xcpretty
+XCODEBUILD_RC=${PIPESTATUS[0]}
+set -e
+
+if [ "$XCODEBUILD_RC" -ne 0 ]; then
+  echo "xcodebuild failed (rc=$XCODEBUILD_RC); errors:"
+  grep -nE "error:|Undefined symbols|ld: " build/xcodebuild.log | head -40 || true
+  exit 1
+fi
 
 APP_PATH="$PWD/build/lara.xcarchive/Products/Applications/lara.app"
 if [ ! -d "$APP_PATH" ]; then
