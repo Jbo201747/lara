@@ -16,6 +16,8 @@
 #import "IconServices.h"
 #import "rc.h"
 #import "RemoteCall.h"
+#import "procpicker.h"
+#import "signdylib.h"
 #import "decrypt.h"
 #import "persistence.h"
 #import "ota.h"

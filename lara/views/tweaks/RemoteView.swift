@@ -26,8 +26,76 @@ struct RemoteView: View {
     @State private var rwxProcess: String = "SpringBoard"
     @State private var rwxLastResult: String = ""
     @State private var rwxPersisted: String = UserDefaults.standard.string(forKey: "rwxLastRunResult") ?? ""
+    @State private var rwxProcesses: [ProcEntry] = []
+    @State private var procFilter: String = ""
+    @State private var procLoading: Bool = false
+    @State private var showSignImport: Bool = false
+    @State private var signSourcePath: String? = nil
+    @State private var signSourceName: String? = nil
+    @State private var signResult: String = ""
+
+    struct ProcEntry: Identifiable {
+        let name: String
+        let pid: Int
+        let uid: Int
+        var id: String { "\(pid)-\(name)" }
+    }
 
     private static let rwxStoreKey = "rwxLastRunResult"
+
+    private func importDylib(_ url: URL) {
+        let needsStop = url.startAccessingSecurityScopedResource()
+        defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
+        do {
+            let fm = FileManager.default
+            let dest = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                .appendingPathComponent("sign-\(UUID().uuidString)-\(url.lastPathComponent)")
+            if fm.fileExists(atPath: dest.path) {
+                try fm.removeItem(at: dest)
+            }
+            try fm.copyItem(at: url, to: dest)
+            signSourcePath = dest.path
+            signSourceName = url.lastPathComponent
+            signResult = ""
+        } catch {
+            signResult = "import failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func runSign() {
+        guard let input = signSourcePath else { return }
+        let outPath = (input as NSString).deletingPathExtension + ".signed.dylib"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = lara_sign_dylib(input, outPath, "com.roooot.lara.tweak", nil, nil)
+            let msg = (r == nil)
+                ? "sign: returned nil"
+                : "\(r!.ok ? "OK" : "FAILED") cdhash=\(r!.cdhash) \(r!.diag)"
+            DispatchQueue.main.async {
+                self.signResult = msg
+            }
+        }
+    }
+
+    // proclist() walks the kernel proc list, so it is a little slow. Keep the
+    // results on a background queue and hop back for the UI.
+    private func refreshProcesses() {
+        procLoading = true
+        let filter = procFilter
+        DispatchQueue.global(qos: .userInitiated).async {
+            let raw = lara_list_processes(filter)
+            let entries = raw.compactMap { dict -> ProcEntry? in
+                guard let name = dict["name"] as? String else { return nil }
+                return ProcEntry(name: name,
+                                 pid: dict["pid"] as? Int ?? 0,
+                                 uid: dict["uid"] as? Int ?? 0)
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            DispatchQueue.main.async {
+                self.rwxProcesses = entries
+                self.procLoading = false
+            }
+        }
+    }
 
     private func persistRwxResult(_ msg: String) {
         rwxLastResult = msg
@@ -399,6 +467,60 @@ struct RemoteView: View {
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
 
+                Button {
+                    refreshProcesses()
+                } label: {
+                    HStack {
+                        Text("Pick target process")
+                        Spacer()
+                        if procLoading {
+                            ProgressView()
+                        } else {
+                            Text("\(rwxProcesses.count)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .disabled(procLoading)
+
+                TextField("Filter processes", text: $procFilter)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .onChange(of: procFilter) { _, _ in
+                        refreshProcesses()
+                    }
+
+                if !rwxProcesses.isEmpty {
+                    ForEach(rwxProcesses, id: \.key) { entry in
+                        Button {
+                            rwxProcess = entry.name
+                        } label: {
+                            HStack {
+                                Text(entry.name)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .lineLimit(1)
+                                Spacer()
+                                Text("pid \(entry.pid)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                if entry.uid != 501 {
+                                    Text("uid \(entry.uid)")
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundColor(.orange)
+                                }
+                                if rwxProcess == entry.name {
+                                    Image(systemName: "checkmark")
+                                        .foregroundColor(.green)
+                                }
+                            }
+                        }
+                    }
+                } else if !procLoading {
+                    Text("No processes matched.")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+
                 if !rwxLastResult.isEmpty {
                     Text(rwxLastResult)
                         .font(.system(.footnote, design: .monospaced))
@@ -414,6 +536,50 @@ struct RemoteView: View {
             // SpringBoard dying takes this app down with it, so the in-memory
             // result is gone by the time you can read it. Persist to disk and
             // restore on next appearance.
+            Section {
+                Button("Choose dylib to sign") {
+                    showSignImport = true
+                }
+
+                if let signSrc = signSourceName {
+                    HStack {
+                        Text("Source")
+                        Spacer()
+                        Text(signSrc)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+
+                Button {
+                    runSign()
+                } label: {
+                    Text("Sign (ad-hoc)")
+                }
+                .disabled(signSourcePath == nil)
+
+                if !signResult.isEmpty {
+                    Text(signResult)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                }
+            } header: {
+                Text("Ad-hoc dylib signing")
+            } footer: {
+                Text("choma builds a hash-based CodeDirectory with no CMS signature. Raw RWX is blocked by the pmap check on iOS 26; a signed dylib is the remaining route.")
+            }
+            .fileImporter(
+                isPresented: $showSignImport,
+                allowedContentTypes: [.item],
+                allowsMultipleSelection: false
+            ) { result in
+                if case .success(let urls) = result, let url = urls.first {
+                    importDylib(url)
+                }
+            }
+
             Section {
                 Text(rwxPersisted.isEmpty ? "No run recorded yet." : rwxPersisted)
                     .font(.system(.footnote, design: .monospaced))
@@ -627,6 +793,7 @@ struct RemoteView: View {
         .navigationTitle(Text("Tweaks"))
         .onAppear {
             rwxPersisted = UserDefaults.standard.string(forKey: Self.rwxStoreKey) ?? ""
+            refreshProcesses()
         }
         .onDisappear {
             if freakyrunning, let proc = mgr.sbProc {
