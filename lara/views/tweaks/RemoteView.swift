@@ -8,6 +8,7 @@
 import SwiftUI
 import UIKit
 import Darwin
+import UniformTypeIdentifiers
 
 struct RemoteView: View {
     @ObservedObject var mgr: laramgr
@@ -194,7 +195,9 @@ struct RemoteView: View {
             TextField("Filter processes", text: $procFilter)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
-                .onChange(of: procFilter) { _, _ in
+                // Pre-iOS 17 form: the deployment target is 16.0, so the
+                // two-parameter onChange(of:initial:_:) is unavailable.
+                .onChange(of: procFilter) { _ in
                     refreshProcesses()
                 }
 
@@ -286,7 +289,8 @@ struct RemoteView: View {
         }
         .fileImporter(
             isPresented: $showSignImport,
-            allowedContentTypes: [.item],
+            // A Mach-O dylib has no dedicated UTType; .data is the honest one.
+            allowedContentTypes: [UTType.data],
             allowsMultipleSelection: false
         ) { result in
             if case .success(let urls) = result, let url = urls.first {
