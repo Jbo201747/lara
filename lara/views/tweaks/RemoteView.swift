@@ -365,9 +365,10 @@ struct RemoteView: View {
                                 "target memset write failed",
                                 "unused",
                                 "unused",
-                                "call to stub failed",
-                                "stub returned wrong value",
+                                "call to stub failed (harness error)",
+                                "call faulted or returned 0",
                                 "write did not land (memcmp mismatch)",
+                                "stub ran, wrong value",
                             ]
                             let which = stage < names.count ? names[stage] : "unknown stage \(stage)"
                             return "rwx FAILED stage \(stage): \(which)\nDIAG: \(diag)"
