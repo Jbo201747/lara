@@ -349,7 +349,11 @@ struct RemoteView: View {
                         defer { proc.destroy() }
 
                         var execAddr: UInt64 = 0
-                        let ret = rc_exec_rwx(proc, sentinel, &execAddr)
+                        var diagBuf = [CChar](repeating: 0, count: 1024)
+                        let ret = diagBuf.withUnsafeMutableBufferPointer { bufPtr -> UInt64 in
+                            rc_exec_rwx(proc, sentinel, &execAddr, bufPtr.baseAddress, 1024)
+                        }
+                        let diag = String(cString: diagBuf)
 
                         // rc_exec_rwx returns 0xF0000000|stage on failure so the
                         // stages are distinguishable; 0 is a valid stub result.
@@ -366,11 +370,11 @@ struct RemoteView: View {
                                 "write did not land (memcmp mismatch)",
                             ]
                             let which = stage < names.count ? names[stage] : "unknown stage \(stage)"
-                            return "rwx FAILED stage \(stage): \(which) (stub@0x\(String(execAddr, radix: 16)))"
+                            return "rwx FAILED stage \(stage): \(which)\nDIAG: \(diag)"
                         }
 
                         let ok = (ret & 0xFFFFFFFF) == (sentinel & 0xFFFFFFFF)
-                        return "rwx: \(process) stub@0x\(String(execAddr, radix: 16)) -> 0x\(String(ret, radix: 16)) (wanted 0x\(String(sentinel, radix: 16))) \(ok ? "OK" : "MISMATCH")"
+                        return "rwx: \(process) stub@0x\(String(execAddr, radix: 16)) -> 0x\(String(ret, radix: 16)) (wanted 0x\(String(sentinel, radix: 16))) \(ok ? "OK" : "MISMATCH")\nDIAG: \(diag)"
                     } onComplete: { msg in
                         self.rwxLastResult = msg
                     }
