@@ -82,14 +82,16 @@ struct RemoteView: View {
         procLoading = true
         let filter = procFilter
         DispatchQueue.global(qos: .userInitiated).async {
-            let raw = lara_list_processes(filter)
-            let entries = raw.compactMap { dict -> ProcEntry? in
-                guard let name = dict["name"] as? String else { return nil }
-                return ProcEntry(name: name,
-                                 pid: dict["pid"] as? Int ?? 0,
-                                 uid: dict["uid"] as? Int ?? 0)
+            guard let raw = lara_list_processes(filter) else {
+                DispatchQueue.main.async { self.procLoading = false }
+                return
             }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            let entries: [ProcEntry] = raw.compactMap { dict -> ProcEntry? in
+                guard let name = dict["name"] as? String else { return nil }
+                let pid = (dict["pid"] as? NSNumber)?.intValue ?? 0
+                let uid = (dict["uid"] as? NSNumber)?.intValue ?? 0
+                return ProcEntry(name: name, pid: pid, uid: uid)
+            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             DispatchQueue.main.async {
                 self.rwxProcesses = entries
                 self.procLoading = false
@@ -104,12 +106,230 @@ struct RemoteView: View {
         UserDefaults.standard.set(record, forKey: Self.rwxStoreKey)
         rwxPersisted = record
     }
+
+    // Split out of `body` on purpose: the inline version pushed the whole
+    // List past the type-checker's expression complexity limit.
+    private func describeRwxStage(_ stage: Int) -> String {
+        let names = [
+            "no-proc",
+            "mmap failed in target",
+            "target memset write failed",
+            "unused",
+            "unused",
+            "call to stub failed (harness error)",
+            "call faulted or returned 0",
+            "write did not land (memcmp mismatch)",
+            "stub ran, wrong value",
+        ]
+        return stage < names.count ? names[stage] : "unknown stage \(stage)"
+    }
+
+    private func runRwxStub() -> String {
+        let process = rwxProcess.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !process.isEmpty else { return "rwx: missing process name" }
+
+        let sentinel = parseUInt64OrInt64BitPattern(rwxSentinel) ?? 0xC0FFEE
+
+        guard let proc = RemoteCall(process: process, useMigFilterBypass: false) else {
+            return "rwx: RemoteCall init failed for \(process)"
+        }
+        defer { proc.destroy() }
+
+        var execAddr: UInt64 = 0
+        var diagBuf = [CChar](repeating: 0, count: 1024)
+        let ret = diagBuf.withUnsafeMutableBufferPointer { bufPtr -> UInt64 in
+            rc_exec_rwx(proc, sentinel, &execAddr, bufPtr.baseAddress, 1024)
+        }
+        let diag = String(cString: diagBuf)
+
+        // rc_exec_rwx returns 0xF0000000|stage on failure so the stages are
+        // distinguishable; 0 is a valid stub result.
+        if (ret & 0xF0000000) == 0xF0000000 {
+            let stage = Int(ret & 0xFFFF)
+            return "rwx FAILED stage \(stage): \(describeRwxStage(stage))\nDIAG: \(diag)"
+        }
+
+        let ok = (ret & 0xFFFFFFFF) == (sentinel & 0xFFFFFFFF)
+        let addrHex = String(execAddr, radix: 16)
+        let retHex = String(ret, radix: 16)
+        let wantHex = String(sentinel, radix: 16)
+        return "rwx: \(process) stub@0x\(addrHex) -> 0x\(retHex) (wanted 0x\(wantHex)) \(ok ? "OK" : "MISMATCH")\nDIAG: \(diag)"
+    }
+
+    private var rwxSection: some View {
+        Section {
+            TextField("RWX sentinel (hex or dec)", text: $rwxSentinel)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.numbersAndPunctuation)
+
+            Button {
+                run("RWX Exec") { self.runRwxStub() } onComplete: { msg in
+                    self.persistRwxResult(msg)
+                }
+            } label: {
+                Text("Execute RWX Stub")
+            }
+
+            TextField("RWX target process", text: $rwxProcess)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            Button {
+                refreshProcesses()
+            } label: {
+                HStack {
+                    Text("Pick target process")
+                    Spacer()
+                    if procLoading {
+                        ProgressView()
+                    } else {
+                        Text("\(rwxProcesses.count)")
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            .disabled(procLoading)
+
+            TextField("Filter processes", text: $procFilter)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .onChange(of: procFilter) { _, _ in
+                    refreshProcesses()
+                }
+
+            processList
+
+            if !rwxLastResult.isEmpty {
+                Text(rwxLastResult)
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+        } header: {
+            Text("RWX Stub Execution")
+        } footer: {
+            Text("Maps a RWX page in the target, writes a movz/movk/ret stub, and calls it. Proves arbitrary code execution in that process.")
+        }
+        .disabled(!mgr.rcready || running)
+    }
+
+    private var processList: some View {
+        Group {
+            if !rwxProcesses.isEmpty {
+                ForEach(rwxProcesses) { entry in
+                    Button {
+                        rwxProcess = entry.name
+                    } label: {
+                        HStack {
+                            Text(entry.name)
+                                .font(.system(.footnote, design: .monospaced))
+                                .lineLimit(1)
+                            Spacer()
+                            Text("pid \(entry.pid)")
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundColor(.secondary)
+                            if entry.uid != 501 {
+                                Text("uid \(entry.uid)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(.orange)
+                            }
+                            if rwxProcess == entry.name {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.green)
+                            }
+                        }
+                    }
+                }
+            } else if !procLoading {
+                Text("No processes matched.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private var signSection: some View {
+        Section {
+            Button("Choose dylib to sign") {
+                showSignImport = true
+            }
+
+            if let signSrc = signSourceName {
+                HStack {
+                    Text("Source")
+                    Spacer()
+                    Text(signSrc)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+
+            Button {
+                runSign()
+            } label: {
+                Text("Sign (ad-hoc)")
+            }
+            .disabled(signSourcePath == nil)
+
+            if !signResult.isEmpty {
+                Text(signResult)
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+        } header: {
+            Text("Ad-hoc dylib signing")
+        } footer: {
+            Text("choma builds a hash-based CodeDirectory with no CMS signature. Raw RWX is blocked by the pmap check on iOS 26; a signed dylib is the remaining route.")
+        }
+        .fileImporter(
+            isPresented: $showSignImport,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                importDylib(url)
+            }
+        }
+    }
+
+    // SpringBoard dying takes this app down with it, so the in-memory result is
+    // gone by the time you can read it. Persist to disk and restore on next
+    // appearance.
+    private var lastRunSection: some View {
+        Section {
+            Text(rwxPersisted.isEmpty ? "No run recorded yet." : rwxPersisted)
+                .font(.system(.footnote, design: .monospaced))
+                .foregroundColor(rwxPersisted.isEmpty ? .secondary : .primary)
+                .textSelection(.enabled)
+
+            HStack {
+                Button("Copy") {
+                    UIPasteboard.general.string = rwxPersisted
+                }
+                .disabled(rwxPersisted.isEmpty)
+
+                Button("Clear") {
+                    UserDefaults.standard.removeObject(forKey: Self.rwxStoreKey)
+                    rwxPersisted = ""
+                }
+                .disabled(rwxPersisted.isEmpty)
+            }
+        } header: {
+            Text("Last Run (survives crash)")
+        }
+        .disabled(!mgr.rcready || running)
+    }
     @State private var hsRows: Int = 6
     @State private var hsColumns: Int = 4
     @State private var freakyrunning: Bool = false
     @State private var freakyseq: Int = 0
 
     private var dockMaxColumns: Int { rcdockunlimited ? 50 : 10 }
+
+    private var euProgressFraction: Double { (mgr.eu1progress + mgr.eu2progress) / 2 }
 
     var body: some View {
         List {
@@ -366,12 +586,12 @@ struct RemoteView: View {
                     } label: {
                         HStack {
                             if mgr.eu1running || mgr.eu2running {
-                                ProgressView(value: (mgr.eu1progress + mgr.eu2progress)/2)
+                                ProgressView(value: euProgressFraction)
                                     .progressViewStyle(.circular)
                                     .frame(width: 18, height: 18)
                                 Text("Running...")
                                 Spacer()
-                                Text("\(Int((mgr.eu1progress + mgr.eu2progress)/2 * 100))%")
+                                Text("\(Int(euProgressFraction * 100))%")
                             } else {
                                 Text("Enable Spoof EU Region")
                                 Spacer()
@@ -410,198 +630,9 @@ struct RemoteView: View {
                 Text("Tools")
             }
             
-            Section {
-                TextField("RWX sentinel (hex or dec)", text: $rwxSentinel)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.numbersAndPunctuation)
-
-                Button {
-                    run("RWX Exec") {
-                        let process = rwxProcess.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !process.isEmpty else { return "rwx: missing process name" }
-
-                        let sentinel = parseUInt64OrInt64BitPattern(rwxSentinel) ?? 0xC0FFEE
-
-                        guard let proc = RemoteCall(process: process, useMigFilterBypass: false) else {
-                            return "rwx: RemoteCall init failed for \(process)"
-                        }
-                        defer { proc.destroy() }
-
-                        var execAddr: UInt64 = 0
-                        var diagBuf = [CChar](repeating: 0, count: 1024)
-                        let ret = diagBuf.withUnsafeMutableBufferPointer { bufPtr -> UInt64 in
-                            rc_exec_rwx(proc, sentinel, &execAddr, bufPtr.baseAddress, 1024)
-                        }
-                        let diag = String(cString: diagBuf)
-
-                        // rc_exec_rwx returns 0xF0000000|stage on failure so the
-                        // stages are distinguishable; 0 is a valid stub result.
-                        if (ret & 0xF0000000) == 0xF0000000 {
-                            let stage = Int(ret & 0xFFFF)
-                            let names = [
-                                "no-proc",
-                                "mmap failed in target",
-                                "target memset write failed",
-                                "unused",
-                                "unused",
-                                "call to stub failed (harness error)",
-                                "call faulted or returned 0",
-                                "write did not land (memcmp mismatch)",
-                                "stub ran, wrong value",
-                            ]
-                            let which = stage < names.count ? names[stage] : "unknown stage \(stage)"
-                            return "rwx FAILED stage \(stage): \(which)\nDIAG: \(diag)"
-                        }
-
-                        let ok = (ret & 0xFFFFFFFF) == (sentinel & 0xFFFFFFFF)
-                        return "rwx: \(process) stub@0x\(String(execAddr, radix: 16)) -> 0x\(String(ret, radix: 16)) (wanted 0x\(String(sentinel, radix: 16))) \(ok ? "OK" : "MISMATCH")\nDIAG: \(diag)"
-                    } onComplete: { msg in
-                        self.persistRwxResult(msg)
-                    }
-                } label: {
-                    Text("Execute RWX Stub")
-                }
-
-                TextField("RWX target process", text: $rwxProcess)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-
-                Button {
-                    refreshProcesses()
-                } label: {
-                    HStack {
-                        Text("Pick target process")
-                        Spacer()
-                        if procLoading {
-                            ProgressView()
-                        } else {
-                            Text("\(rwxProcesses.count)")
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-                .disabled(procLoading)
-
-                TextField("Filter processes", text: $procFilter)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .onChange(of: procFilter) { _, _ in
-                        refreshProcesses()
-                    }
-
-                if !rwxProcesses.isEmpty {
-                    ForEach(rwxProcesses, id: \.key) { entry in
-                        Button {
-                            rwxProcess = entry.name
-                        } label: {
-                            HStack {
-                                Text(entry.name)
-                                    .font(.system(.footnote, design: .monospaced))
-                                    .lineLimit(1)
-                                Spacer()
-                                Text("pid \(entry.pid)")
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                                if entry.uid != 501 {
-                                    Text("uid \(entry.uid)")
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundColor(.orange)
-                                }
-                                if rwxProcess == entry.name {
-                                    Image(systemName: "checkmark")
-                                        .foregroundColor(.green)
-                                }
-                            }
-                        }
-                    }
-                } else if !procLoading {
-                    Text("No processes matched.")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-
-                if !rwxLastResult.isEmpty {
-                    Text(rwxLastResult)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .textSelection(.enabled)
-                }
-            } header: {
-                Text("RWX Stub Execution")
-            } footer: {
-                Text("Maps a RWX page in the target, writes a movz/movk/ret stub, and calls it. Proves arbitrary code execution in that process.")
-            }
-
-            // SpringBoard dying takes this app down with it, so the in-memory
-            // result is gone by the time you can read it. Persist to disk and
-            // restore on next appearance.
-            Section {
-                Button("Choose dylib to sign") {
-                    showSignImport = true
-                }
-
-                if let signSrc = signSourceName {
-                    HStack {
-                        Text("Source")
-                        Spacer()
-                        Text(signSrc)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-
-                Button {
-                    runSign()
-                } label: {
-                    Text("Sign (ad-hoc)")
-                }
-                .disabled(signSourcePath == nil)
-
-                if !signResult.isEmpty {
-                    Text(signResult)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .textSelection(.enabled)
-                }
-            } header: {
-                Text("Ad-hoc dylib signing")
-            } footer: {
-                Text("choma builds a hash-based CodeDirectory with no CMS signature. Raw RWX is blocked by the pmap check on iOS 26; a signed dylib is the remaining route.")
-            }
-            .fileImporter(
-                isPresented: $showSignImport,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: false
-            ) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    importDylib(url)
-                }
-            }
-
-            Section {
-                Text(rwxPersisted.isEmpty ? "No run recorded yet." : rwxPersisted)
-                    .font(.system(.footnote, design: .monospaced))
-                    .foregroundColor(rwxPersisted.isEmpty ? .secondary : .primary)
-                    .textSelection(.enabled)
-
-                HStack {
-                    Button("Copy") {
-                        UIPasteboard.general.string = rwxPersisted
-                    }
-                    .disabled(rwxPersisted.isEmpty)
-
-                    Button("Clear") {
-                        UserDefaults.standard.removeObject(forKey: Self.rwxStoreKey)
-                        rwxPersisted = ""
-                    }
-                    .disabled(rwxPersisted.isEmpty)
-                }
-            } header: {
-                Text("Last Run (survives crash)")
-            }
-            .disabled(!mgr.rcready || running)
+            rwxSection
+            signSection
+            lastRunSection
 
             Section {
                 TextField("Process name", text: $customProcessName)
