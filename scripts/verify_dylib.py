@@ -28,9 +28,9 @@ TEXT_SECT_SIZE = 0x1000
 DATA_SEG_VMADDR = 0x4000
 DATA_SEG_FILEOFF = 0x4000
 DATA_SEG_FILESIZE = 0x4000
-IMAGE_SIZE = 0x10000
+IMAGE_SIZE = 0xF000
 SIG_FILEOFF = 0xF000
-SIG_FILESIZE = 0x1000
+SIG_FILESIZE = 0x0
 LARA_DYLIB_GLOBAL_OFF = 0x0  # was 0x4000 -> global landed past end of image
 LARA_DYLIB_MAGIC = 0x10BADF00D
 DYLIB_ID = "com.roooot.lara.dylibtest"
@@ -361,6 +361,59 @@ def check(ncmds, sizeofcmds, commands, blob):
                   % (dataoff, datasize))
         if dataoff < DATA_SEG_VMADDR + DATA_SEG_FILESIZE:
             bad("signature region overlaps __DATA")
+
+    # --- rehearse the splice signdylib.m performs ---
+    #
+    # macho_replace_code_signature() is unusable here: it trims by
+    # (streamSize - dataoff) whenever that exceeds the new blob's length, which
+    # for a zero-filled region is always true, so it deletes the space and then
+    # writes the signature past the new end of file while ignoring that write's
+    # return value. signdylib.m therefore appends by hand. This performs the
+    # same append with a synthetic superblob so the resulting layout can be
+    # checked, and writes gen-signed.dylib for llvm-readobj to parse.
+    sig_cmd = [c for c in commands if c[0] == "LC_CODE_SIGNATURE"]
+    if sig_cmd:
+        cmd_off = sig_cmd[0][2]
+        synthetic = bytearray(0x100)
+        synthetic[0:4] = bytes([0xFA, 0xDE, 0x0C, 0xC0])  # embedded signature
+        synthetic[4:8] = (0x100).to_bytes(4, "big")         # length
+        synthetic[8:12] = (1).to_bytes(4, "big")            # count
+        dataoff = len(blob)
+        struct.pack_into("<I", blob, cmd_off + 8, dataoff)
+        struct.pack_into("<I", blob, cmd_off + 12, len(synthetic))
+        signed = bytes(blob) + bytes(synthetic)
+        with open(os.path.join(HERE, "gen-signed.dylib"), "wb") as f:
+            f.write(signed)
+
+        # Re-walk the result exactly the way the harness would.
+        n2 = struct.unpack_from("<I", signed, 16)[0]
+        off2 = 32
+        seen = False
+        for _ in range(n2):
+            if off2 + 8 > len(signed):
+                break
+            cmd, csz = struct.unpack_from("<II", signed, off2)
+            if csz < 8 or off2 + csz > len(signed):
+                bad("signed image: load command at 0x%x has bad cmdsize %d"
+                    % (off2, csz))
+                break
+            if cmd == LC_CODE_SIGNATURE:
+                do, ds = struct.unpack_from("<II", signed, off2 + 8)
+                if do != dataoff:
+                    bad("signed image: dataoff 0x%x != appended 0x%x" % (do, dataoff))
+                elif do + ds != len(signed):
+                    bad("signed image: dataoff+datasize 0x%x != filesize 0x%x"
+                        % (do + ds, len(signed)))
+                elif signed[do:do + 4] != bytes([0xFA, 0xDE, 0x0C, 0xC0]):
+                    bad("signed image: no superblob magic at 0x%x" % do)
+                else:
+                    print("  ok    splice rehearsal: sig=0x%x+0x%x, filesize 0x%x"
+                          % (do, ds, len(signed)))
+                    print("  ok    wrote gen-signed.dylib for llvm-readobj")
+                    seen = True
+            off2 += csz
+        if not seen and not any("signed image" in x for x in []):
+            bad("splice rehearsal: no LC_CODE_SIGNATURE found in the result")
 
     return ok
 
