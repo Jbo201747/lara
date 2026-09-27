@@ -158,7 +158,10 @@ struct RemoteView: View {
             : (parseUInt64OrInt64BitPattern(rwxSentinel) ?? 0xC0FFEE)
 
         guard let proc = RemoteCall(process: process, useMigFilterBypass: false) else {
-            return "rwx: RemoteCall init failed for \(process)"
+            // procbyname() only finds processes that are actually running, so
+            // this is almost always "the app is not open", not a broken
+            // RemoteCall. Saying so saves a lot of guessing.
+            return "rwx: no running process named '\(process)'. Open it first and leave it in the foreground, then run this. (Geode must be open; SpringBoard is always running.)"
         }
         defer { proc.destroy() }
 

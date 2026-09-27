@@ -28,7 +28,9 @@ TEXT_SECT_SIZE = 0x1000
 DATA_SEG_VMADDR = 0x4000
 DATA_SEG_FILEOFF = 0x4000
 DATA_SEG_FILESIZE = 0x4000
-IMAGE_SIZE = 0x8000
+IMAGE_SIZE = 0x10000
+SIG_FILEOFF = 0xF000
+SIG_FILESIZE = 0x1000
 LARA_DYLIB_GLOBAL_OFF = 0x0  # was 0x4000 -> global landed past end of image
 LARA_DYLIB_MAGIC = 0x10BADF00D
 DYLIB_ID = "com.roooot.lara.dylibtest"
@@ -47,6 +49,7 @@ LC_LOAD_DYLIB = 0x0C
 LC_MAIN = 0x80000028
 LC_BUILD_VERSION = 0x32
 LC_DYLD_INFO_ONLY = 0x80000022
+LC_CODE_SIGNATURE = 0x1D
 PLATFORM_IOS = 2
 
 
@@ -186,6 +189,15 @@ def build():
     commands.append(("LC_DYLD_INFO_ONLY", cmdsize, lc))
     lc += cmdsize
 
+    # ---- LC_CODE_SIGNATURE (placeholder region; choma overwrites it) ----
+    cmdsize = 16
+    img.u32(lc + 0, LC_CODE_SIGNATURE)
+    img.u32(lc + 4, cmdsize)
+    img.u32(lc + 8, SIG_FILEOFF)
+    img.u32(lc + 12, SIG_FILESIZE)
+    commands.append(("LC_CODE_SIGNATURE", cmdsize, lc))
+    lc += cmdsize
+
     ncmds = len(commands)
     sizeofcmds = lc - 32
     img.u32(16, ncmds)
@@ -317,6 +329,38 @@ def check(ncmds, sizeofcmds, commands, blob):
                 bad("%s name.offset %d resolves to an empty string" % (name, noff))
             else:
                 print("  ok    %s name.offset=%d -> %r" % (name, noff, text))
+
+    # --- choma's code-slot arithmetic (csd_code_directory_update_code_slots) ---
+    #
+    # csd_code_directory_init sets nCodeSlots = align_to_size(streamSize, 0x1000) >> 12,
+    # i.e. it counts pages of the WHOLE file, not of __TEXT. For the last slot
+    # code_directory_calculate_page_hash() then requires
+    #     lastSlotOffset <= dataoff(from LC_CODE_SIGNATURE)
+    # and returns failure (0) when that does not hold. get_image_base() treats
+    # that 0 as an error, which is the "update_code_slots failed" we saw.
+    sig = [c for c in commands if c[0] == "LC_CODE_SIGNATURE"]
+    if not sig:
+        bad("no LC_CODE_SIGNATURE: choma's page-hash bounds lookup returns "
+            "dataoff=0 and the last code slot fails")
+    else:
+        dataoff = struct.unpack_from("<I", blob, sig[0][2] + 8)[0]
+        datasize = struct.unpack_from("<I", blob, sig[0][2] + 12)[0]
+        n_slots = ((len(blob) + 0xFFF) // 0x1000)
+        last_off = (n_slots - 1) * 0x1000
+        if last_off > dataoff:
+            bad("last code slot at 0x%x > LC_CODE_SIGNATURE dataoff 0x%x -- "
+                "choma will fail hashing it" % (last_off, dataoff))
+        else:
+            print("  ok    %d code slots, last at 0x%x <= dataoff 0x%x"
+                  % (n_slots, last_off, dataoff))
+        if dataoff + datasize > len(blob):
+            bad("signature region 0x%x+0x%x exceeds the image"
+                % (dataoff, datasize))
+        else:
+            print("  ok    signature region 0x%x+0x%x reserved in the image"
+                  % (dataoff, datasize))
+        if dataoff < DATA_SEG_VMADDR + DATA_SEG_FILESIZE:
+            bad("signature region overlaps __DATA")
 
     return ok
 
