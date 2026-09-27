@@ -143,11 +143,19 @@ struct RemoteView: View {
         return stage < names.count ? names[stage] : "unknown stage \(stage)"
     }
 
-    private func runRwxStub() -> String {
+    private func runRwxStub(probeOnly: Bool = false) -> String {
         let process = rwxProcess.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !process.isEmpty else { return "rwx: missing process name" }
 
-        let sentinel = parseUInt64OrInt64BitPattern(rwxSentinel) ?? 0xC0FFEE
+        // rc_exec_rwx treats 0xDEADBEEF as "map, write, verify, report the
+        // kernel's protection bits, and return without ever calling the stub".
+        // That is the only way to get the pmap reading without risking the
+        // target, so it gets a button of its own instead of being reachable
+        // only by typing a magic number into the sentinel field -- which is
+        // how Geode ended up crashed.
+        let sentinel: UInt64 = probeOnly
+            ? 0xDEADBEEF
+            : (parseUInt64OrInt64BitPattern(rwxSentinel) ?? 0xC0FFEE)
 
         guard let proc = RemoteCall(process: process, useMigFilterBypass: false) else {
             return "rwx: RemoteCall init failed for \(process)"
@@ -169,6 +177,10 @@ struct RemoteView: View {
         }
 
         let ok = (ret & 0xFFFFFFFF) == (sentinel & 0xFFFFFFFF)
+        if probeOnly {
+            let addrHex = String(execAddr, radix: 16)
+            return "rwx PROBE ONLY on \(process): mapped 0x\(addrHex), stub NOT called, target untouched.\nDIAG: \(diag)"
+        }
         let addrHex = String(execAddr, radix: 16)
         let retHex = String(ret, radix: 16)
         let wantHex = String(sentinel, radix: 16)
@@ -209,12 +221,22 @@ struct RemoteView: View {
                 }
             }
 
-            Button {
-                run("RWX Exec") { self.runRwxStub() } onComplete: { msg in
-                    self.persistRwxResult(msg)
+            HStack {
+                Button {
+                    run("RWX Exec") { self.runRwxStub() } onComplete: { msg in
+                        self.persistRwxResult(msg)
+                    }
+                } label: {
+                    Text("Execute RWX Stub")
                 }
-            } label: {
-                Text("Execute RWX Stub")
+
+                Button {
+                    run("RWX Probe") { self.runRwxStub(probeOnly: true) } onComplete: { msg in
+                        self.persistRwxResult(msg)
+                    }
+                } label: {
+                    Text("Probe Only (safe)")
+                }
             }
             // Only the execution itself needs RemoteCall to be live. The whole
             // section used to be gated on rcready, which left the picker
