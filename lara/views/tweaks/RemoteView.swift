@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import UIKit
 import Darwin
 
 struct RemoteView: View {
@@ -24,6 +25,17 @@ struct RemoteView: View {
     @State private var rwxSentinel: String = "0xC0FFEE"
     @State private var rwxProcess: String = "SpringBoard"
     @State private var rwxLastResult: String = ""
+    @State private var rwxPersisted: String = ""
+
+    private static let rwxStoreKey = "rwxLastRunResult"
+
+    private func persistRwxResult(_ msg: String) {
+        rwxLastResult = msg
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .short, timeStyle: .medium)
+        let record = "[\(stamp)] \(msg)"
+        UserDefaults.standard.set(record, forKey: Self.rwxStoreKey)
+        rwxPersisted = record
+    }
     @State private var hsRows: Int = 6
     @State private var hsColumns: Int = 4
     @State private var freakyrunning: Bool = false
@@ -377,7 +389,7 @@ struct RemoteView: View {
                         let ok = (ret & 0xFFFFFFFF) == (sentinel & 0xFFFFFFFF)
                         return "rwx: \(process) stub@0x\(String(execAddr, radix: 16)) -> 0x\(String(ret, radix: 16)) (wanted 0x\(String(sentinel, radix: 16))) \(ok ? "OK" : "MISMATCH")\nDIAG: \(diag)"
                     } onComplete: { msg in
-                        self.rwxLastResult = msg
+                        self.persistRwxResult(msg)
                     }
                 } label: {
                     Text("Execute RWX Stub")
@@ -397,6 +409,31 @@ struct RemoteView: View {
                 Text("RWX Stub Execution")
             } footer: {
                 Text("Maps a RWX page in the target, writes a movz/movk/ret stub, and calls it. Proves arbitrary code execution in that process.")
+            }
+
+            // SpringBoard dying takes this app down with it, so the in-memory
+            // result is gone by the time you can read it. Persist to disk and
+            // restore on next appearance.
+            Section {
+                Text(rwxPersisted.isEmpty ? "No run recorded yet." : rwxPersisted)
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundColor(rwxPersisted.isEmpty ? .secondary : .primary)
+                    .textSelection(.enabled)
+
+                HStack {
+                    Button("Copy") {
+                        UIPasteboard.general.string = rwxPersisted
+                    }
+                    .disabled(rwxPersisted.isEmpty)
+
+                    Button("Clear") {
+                        UserDefaults.standard.removeObject(forKey: Self.rwxStoreKey)
+                        rwxPersisted = ""
+                    }
+                    .disabled(rwxPersisted.isEmpty)
+                }
+            } header: {
+                Text("Last Run (survives crash)")
             }
             .disabled(!mgr.rcready || running)
 
@@ -588,6 +625,9 @@ struct RemoteView: View {
             }
         }
         .navigationTitle(Text("Tweaks"))
+        .onAppear {
+            rwxPersisted = UserDefaults.standard.string(forKey: Self.rwxStoreKey) ?? ""
+        }
         .onDisappear {
             if freakyrunning, let proc = mgr.sbProc {
                 stopfreakydog(proc)
