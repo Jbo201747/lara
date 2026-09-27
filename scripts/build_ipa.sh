@@ -18,9 +18,15 @@ xcodebuild \
   CODE_SIGN_IDENTITY="" \
   CODE_SIGN_ENTITLEMENTS="Config/lara.entitlements" \
   archive \
-  -archivePath "$PWD/build/lara.xcarchive" 2>&1 | xcpretty
+  -archivePath "$PWD/build/lara.xcarchive" 2>&1 | tee build/xcodebuild.log | xcpretty
 
 APP_PATH="$PWD/build/lara.xcarchive/Products/Applications/lara.app"
+if [ ! -d "$APP_PATH" ]; then
+  echo "Missing app at $APP_PATH"
+  echo "----- xcodebuild errors -----"
+  grep -nE "error:|Undefined symbols|ld: " build/xcodebuild.log 2>/dev/null | head -40 || true
+  exit 1
+fi
 if [ ! -d "$APP_PATH" ]; then
   echo "Missing app at $APP_PATH"
   exit 1
