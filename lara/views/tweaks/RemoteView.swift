@@ -21,6 +21,9 @@ struct RemoteView: View {
     @State private var customTimeoutMs: Int = 100
     @State private var customMigBypass: Bool = false
     @State private var customLastResult: String = ""
+    @State private var rwxSentinel: String = "0xC0FFEE"
+    @State private var rwxProcess: String = "SpringBoard"
+    @State private var rwxLastResult: String = ""
     @State private var hsRows: Int = 6
     @State private var hsColumns: Int = 4
     @State private var freakyrunning: Bool = false
@@ -327,6 +330,51 @@ struct RemoteView: View {
                 Text("Tools")
             }
             
+            Section {
+                TextField("RWX sentinel (hex or dec)", text: $rwxSentinel)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.numbersAndPunctuation)
+
+                Button {
+                    run("RWX Exec") {
+                        let process = rwxProcess.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !process.isEmpty else { return "rwx: missing process name" }
+
+                        let sentinel = parseUInt64OrInt64BitPattern(rwxSentinel) ?? 0xC0FFEE
+
+                        guard let proc = RemoteCall(process: process, useMigFilterBypass: false) else {
+                            return "rwx: RemoteCall init failed for \(process)"
+                        }
+                        defer { proc.destroy() }
+
+                        var execAddr: UInt64 = 0
+                        let ret = rc_exec_rwx(proc, sentinel, &execAddr)
+                        return "rwx: \(process) stub@0x\(String(execAddr, radix: 16)) -> 0x\(String(ret, radix: 16)) / \(ret) (wanted \(sentinel))"
+                    } onComplete: { msg in
+                        self.rwxLastResult = msg
+                    }
+                } label: {
+                    Text("Execute RWX Stub")
+                }
+
+                TextField("RWX target process", text: $rwxProcess)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                if !rwxLastResult.isEmpty {
+                    Text(rwxLastResult)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                }
+            } header: {
+                Text("RWX Stub Execution")
+            } footer: {
+                Text("Maps a RWX page in the target, writes a movz/movk/ret stub, and calls it. Proves arbitrary code execution in that process.")
+            }
+            .disabled(!mgr.rcready || running)
+
             Section {
                 TextField("Process name", text: $customProcessName)
                     .textInputAutocapitalization(.never)
