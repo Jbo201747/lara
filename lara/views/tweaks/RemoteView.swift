@@ -350,7 +350,26 @@ struct RemoteView: View {
 
                         var execAddr: UInt64 = 0
                         let ret = rc_exec_rwx(proc, sentinel, &execAddr)
-                        return "rwx: \(process) stub@0x\(String(execAddr, radix: 16)) -> 0x\(String(ret, radix: 16)) / \(ret) (wanted \(sentinel))"
+
+                        // rc_exec_rwx returns 0xF0000000|stage on failure so the
+                        // stages are distinguishable; 0 is a valid stub result.
+                        if (ret & 0xF0000000) == 0xF0000000 {
+                            let stage = Int(ret & 0xFFFF)
+                            let names = [
+                                "no-proc",
+                                "mmap failed in target",
+                                "remote_write failed",
+                                "remote read-back failed",
+                                "read-back mismatch (write did not land)",
+                                "call to stub failed",
+                                "stub returned wrong value",
+                            ]
+                            let which = stage < names.count ? names[stage] : "unknown stage \(stage)"
+                            return "rwx FAILED stage \(stage): \(which) (stub@0x\(String(execAddr, radix: 16)))"
+                        }
+
+                        let ok = (ret & 0xFFFFFFFF) == (sentinel & 0xFFFFFFFF)
+                        return "rwx: \(process) stub@0x\(String(execAddr, radix: 16)) -> 0x\(String(ret, radix: 16)) (wanted 0x\(String(sentinel, radix: 16))) \(ok ? "OK" : "MISMATCH")"
                     } onComplete: { msg in
                         self.rwxLastResult = msg
                     }
