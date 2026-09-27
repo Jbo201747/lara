@@ -18,6 +18,8 @@
 #import "RemoteCall.h"
 #import "procpicker.h"
 #import "signdylib.h"
+#import "dylibbuild.h"
+#import "dylibtest.h"
 #import "decrypt.h"
 #import "persistence.h"
 #import "ota.h"

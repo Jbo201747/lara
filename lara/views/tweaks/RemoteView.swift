@@ -35,6 +35,8 @@ struct RemoteView: View {
     @State private var signSourcePath: String? = nil
     @State private var signSourceName: String? = nil
     @State private var signResult: String = ""
+    @State private var dylibTestResult: String = ""
+    @State private var dylibTestRunning: Bool = false
 
     struct ProcEntry: Identifiable {
         let name: String
@@ -425,6 +427,64 @@ struct RemoteView: View {
         }
     }
 
+    // The whole point of the choma harness, reduced to one button: build a dylib
+    // in memory, sign it, write it where the target can open it, dlopen it, and
+    // report whether the load was accepted. A non-NULL handle means cs_validate
+    // took the ad-hoc signature with no trust-cache entry, which is the question
+    // the whole RWX detour was circling.
+    private var dylibTestSection: some View {
+        Section {
+            HStack {
+                Text("Target")
+                Spacer()
+                Text(rwxProcess.isEmpty ? "(none)" : rwxProcess)
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            Button {
+                runDylibTest()
+            } label: {
+                HStack {
+                    Text("Build, Sign, and dlopen")
+                    Spacer()
+                    if dylibTestRunning {
+                        ProgressView()
+                    }
+                }
+            }
+            .disabled(dylibTestRunning || rwxProcess.isEmpty)
+
+            if !dylibTestResult.isEmpty {
+                Text(dylibTestResult)
+                    .font(.system(.footnote, design: .monospaced))
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+            }
+        } header: {
+            Text("Dylib load test")
+        } footer: {
+            Text("Answers the open question: does cs_validate accept an ad-hoc signature with no trust-cache entry? Needs DarkSword, RemoteCall, and VFS initialised. A sandboxed target may not be able to open the file, which is reported separately from a signature rejection.")
+        }
+    }
+
+    private func runDylibTest() {
+        let process = rwxProcess.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !process.isEmpty else { return }
+        dylibTestRunning = true
+        dylibTestResult = "working…"
+        DispatchQueue.global(qos: .userInitiated).async {
+            var buf = [CChar](repeating: 0, count: 2048)
+            lara_dylib_load_test(process, 0, &buf, 2048)
+            let report = String(cString: buf)
+            DispatchQueue.main.async {
+                self.dylibTestResult = report
+                self.dylibTestRunning = false
+            }
+        }
+    }
+
     // SpringBoard dying takes this app down with it, so the in-memory result is
     // gone by the time you can read it. Persist to disk and restore on next
     // appearance.
@@ -762,6 +822,7 @@ struct RemoteView: View {
             
             rwxSection
             signSection
+            dylibTestSection
             lastRunSection
 
             Section {
