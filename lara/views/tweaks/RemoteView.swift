@@ -25,7 +25,7 @@ struct RemoteView: View {
     @State private var rwxSentinel: String = "0xC0FFEE"
     @State private var rwxProcess: String = "SpringBoard"
     @State private var rwxLastResult: String = ""
-    @State private var rwxPersisted: String = ""
+    @State private var rwxPersisted: String = UserDefaults.standard.string(forKey: "rwxLastRunResult") ?? ""
 
     private static let rwxStoreKey = "rwxLastRunResult"
 
