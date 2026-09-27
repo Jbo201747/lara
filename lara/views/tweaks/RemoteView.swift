@@ -358,9 +358,9 @@ struct RemoteView: View {
                             let names = [
                                 "no-proc",
                                 "mmap failed in target",
-                                "remote_write failed",
-                                "remote read-back failed",
-                                "read-back mismatch (write did not land)",
+                                "target memset write failed",
+                                "unused",
+                                "unused",
                                 "call to stub failed",
                                 "stub returned wrong value",
                             ]
