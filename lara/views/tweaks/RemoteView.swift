@@ -363,6 +363,7 @@ struct RemoteView: View {
                                 "unused",
                                 "call to stub failed",
                                 "stub returned wrong value",
+                                "write did not land (memcmp mismatch)",
                             ]
                             let which = stage < names.count ? names[stage] : "unknown stage \(stage)"
                             return "rwx FAILED stage \(stage): \(which) (stub@0x\(String(execAddr, radix: 16)))"
