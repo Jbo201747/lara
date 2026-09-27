@@ -30,6 +30,7 @@ struct RemoteView: View {
     @State private var rwxProcesses: [ProcEntry] = []
     @State private var procFilter: String = ""
     @State private var procLoading: Bool = false
+    @State private var showProcPicker: Bool = false
     @State private var showSignImport: Bool = false
     @State private var signSourcePath: String? = nil
     @State private var signSourceName: String? = nil
@@ -79,20 +80,35 @@ struct RemoteView: View {
 
     // proclist() walks the kernel proc list, so it is a little slow. Keep the
     // results on a background queue and hop back for the UI.
+    //
+    // The kernel truncates p_name to MAXCOMLEN (16 bytes on Darwin), so a long
+    // process name arrives already clipped. Fetch the whole list unfiltered and
+    // narrow it here instead, which also lets the search box match on pid as
+    // well as name.
     private func refreshProcesses() {
         procLoading = true
-        let filter = procFilter
+        let filter = procFilter.trimmingCharacters(in: .whitespacesAndNewlines)
         DispatchQueue.global(qos: .userInitiated).async {
-            guard let raw = lara_list_processes(filter) else {
+            guard let raw = lara_list_processes("") else {
                 DispatchQueue.main.async { self.procLoading = false }
                 return
             }
-            let entries: [ProcEntry] = raw.compactMap { dict -> ProcEntry? in
-                guard let name = dict["name"] as? String else { return nil }
+            var entries: [ProcEntry] = raw.compactMap { dict -> ProcEntry? in
+                guard let name = dict["name"] as? String, !name.isEmpty else { return nil }
                 let pid = (dict["pid"] as? NSNumber)?.intValue ?? 0
                 let uid = (dict["uid"] as? NSNumber)?.intValue ?? 0
                 return ProcEntry(name: name, pid: pid, uid: uid)
-            }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            }
+            if !filter.isEmpty {
+                entries = entries.filter {
+                    $0.name.localizedCaseInsensitiveContains(filter)
+                        || String($0.pid) == filter
+                }
+            }
+            entries.sort { lhs, rhs in
+                let c = lhs.name.localizedCaseInsensitiveCompare(rhs.name)
+                return c == .orderedSame ? lhs.pid < rhs.pid : c == .orderedAscending
+            }
             DispatchQueue.main.async {
                 self.rwxProcesses = entries
                 self.procLoading = false
@@ -164,6 +180,33 @@ struct RemoteView: View {
                 .autocorrectionDisabled()
                 .keyboardType(.numbersAndPunctuation)
 
+            // Tapping the field or the row opens the full scrollable list.
+            // Kept as a NavigationLink-free button so it works inside a List
+            // section without pushing a whole new view onto the nav stack.
+            Button {
+                procFilter = ""
+                showProcPicker = true
+                refreshProcesses()
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Target process")
+                            .font(.subheadline)
+                            .foregroundColor(.primary)
+                        Text(rwxProcess.isEmpty ? "Tap to choose…" : rwxProcess)
+                            .font(.system(.footnote, design: .monospaced))
+                            .foregroundColor(rwxProcess.isEmpty ? .secondary : .blue)
+                    }
+                    Spacer()
+                    if procLoading {
+                        ProgressView()
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                }
+            }
+
             Button {
                 run("RWX Exec") { self.runRwxStub() } onComplete: { msg in
                     self.persistRwxResult(msg)
@@ -171,37 +214,10 @@ struct RemoteView: View {
             } label: {
                 Text("Execute RWX Stub")
             }
-
-            TextField("RWX target process", text: $rwxProcess)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-
-            Button {
-                refreshProcesses()
-            } label: {
-                HStack {
-                    Text("Pick target process")
-                    Spacer()
-                    if procLoading {
-                        ProgressView()
-                    } else {
-                        Text("\(rwxProcesses.count)")
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-            .disabled(procLoading)
-
-            TextField("Filter processes", text: $procFilter)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                // Pre-iOS 17 form: the deployment target is 16.0, so the
-                // two-parameter onChange(of:initial:_:) is unavailable.
-                .onChange(of: procFilter) { _ in
-                    refreshProcesses()
-                }
-
-            processList
+            // Only the execution itself needs RemoteCall to be live. The whole
+            // section used to be gated on rcready, which left the picker
+            // inert and made it look like Geode was missing.
+            .disabled(!mgr.rcready || running)
 
             if !rwxLastResult.isEmpty {
                 Text(rwxLastResult)
@@ -214,42 +230,152 @@ struct RemoteView: View {
         } footer: {
             Text("Maps a RWX page in the target, writes a movz/movk/ret stub, and calls it. Proves arbitrary code execution in that process.")
         }
-        .disabled(!mgr.rcready || running)
     }
 
-    private var processList: some View {
-        Group {
+    // Full-height scrollable process list, in the style of StikDebug: a search
+    // field pinned at the top, one tappable row per process, and the selected
+    // one marked. Presented as a sheet so it can be scrolled with a real
+    // scroll wheel instead of being crammed inline in the form.
+    private var procPickerSheet: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                // An explicit field rather than .searchable: on iOS 16 inside a
+                // sheet the modifier hides the field in the nav bar until you
+                // pull down, which is easy to miss when you are hunting for one
+                // specific process.
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("Filter by name or pid", text: $procFilter)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.default)
+                        .onChange(of: procFilter) { _ in
+                            refreshProcesses()
+                        }
+                    if !procFilter.isEmpty {
+                        Button {
+                            procFilter = ""
+                            refreshProcesses()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
+
+                Divider()
+
+                procListBody
+            }
+            .navigationTitle("Processes")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showProcPicker = false }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        refreshProcesses()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                }
+            }
+        }
+        .navigationViewStyle(.stack)
+    }
+
+    private var procListBody: some View {
+        List {
             if !rwxProcesses.isEmpty {
                 ForEach(rwxProcesses) { entry in
                     Button {
                         rwxProcess = entry.name
+                        showProcPicker = false
                     } label: {
-                        HStack {
-                            Text(entry.name)
-                                .font(.system(.footnote, design: .monospaced))
-                                .lineLimit(1)
-                            Spacer()
-                            Text("pid \(entry.pid)")
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.secondary)
-                            if entry.uid != 501 {
-                                Text("uid \(entry.uid)")
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.orange)
-                            }
-                            if rwxProcess == entry.name {
-                                Image(systemName: "checkmark")
-                                    .foregroundColor(.green)
-                            }
-                        }
+                        procRow(entry)
                     }
+                    .buttonStyle(.plain)
                 }
-            } else if !procLoading {
-                Text("No processes matched.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
+            } else if procLoading {
+                HStack {
+                    Spacer()
+                    ProgressView()
+                    Spacer()
+                }
+                .padding(.vertical, 40)
+            } else {
+                VStack(spacing: 8) {
+                    Text(emptyTitle)
+                        .font(.headline)
+                    Text(emptyDetail)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 40)
             }
         }
+        .listStyle(.plain)
+    }
+
+    // proclist() walks the kernel proc list, which needs the darksword
+    // primitives to be initialised. That is a separate step from RemoteCall,
+    // and it is the usual reason the list comes back empty.
+    private var dsReady: Bool { mgr.dsready }
+
+    private var emptyTitle: String {
+        if procFilter.isEmpty { return "No processes" }
+        return "No processes matched"
+    }
+
+    private var emptyDetail: String {
+        if !procFilter.isEmpty {
+            return "Nothing matches “\(procFilter)”. Only running processes appear here, and the kernel truncates names to 15 characters — try a shorter fragment, or the pid."
+        }
+        if mgr.dsrunning {
+            return "Darksword is still starting up. Wait for it to finish, then refresh."
+        }
+        if mgr.dsfailed {
+            return "Darksword failed to initialise, so the kernel process list cannot be read. Run the DarkSword exploit first."
+        }
+        if !dsReady {
+            return "The kernel process list is unavailable until DarkSword is initialised. Run the DarkSword exploit, then reopen this list."
+        }
+        return "The process list came back empty. Make sure RemoteCall is running."
+    }
+
+    private func procRow(_ entry: ProcEntry) -> some View {
+        HStack(spacing: 10) {
+            Text(entry.name)
+                .font(.system(.body, design: .monospaced))
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Text("\(entry.pid)")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+            if entry.uid != 501 {
+                Text("uid \(entry.uid)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.orange)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.orange.opacity(0.15))
+                    .cornerRadius(4)
+            }
+            if rwxProcess == entry.name {
+                Image(systemName: "checkmark")
+                    .foregroundColor(.green)
+            }
+        }
+        .contentShape(Rectangle())
+        .padding(.vertical, 2)
     }
 
     private var signSection: some View {
@@ -829,6 +955,9 @@ struct RemoteView: View {
         .onAppear {
             rwxPersisted = UserDefaults.standard.string(forKey: Self.rwxStoreKey) ?? ""
             refreshProcesses()
+        }
+        .sheet(isPresented: $showProcPicker) {
+            procPickerSheet
         }
         .onDisappear {
             if freakyrunning, let proc = mgr.sbProc {
